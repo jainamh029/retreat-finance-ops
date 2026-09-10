@@ -78,6 +78,13 @@ def dashboard_summary(as_of: str | None = None):
     return dao.dashboard_summary(as_of)
 
 
+@app.get("/api/dashboard/insights")
+def dashboard_insights(as_of: str | None = None):
+    """Heavier derived KPIs in one payload: DSO/DPO reconstructed trend, CEI, top overdue
+    clients/vendors, vendor-category spend, audit-findings breakdown. All from real data."""
+    return dao.dashboard_insights(as_of)
+
+
 # --------------------------------------------------------------------------------------
 # AR / AP lists
 # --------------------------------------------------------------------------------------
@@ -150,6 +157,13 @@ def reconciliation_report(
 ):
     return dao.reconciliation_report(
         _recon_cfg(amount_tol_pct, amount_tol_abs, date_window_days, min_name_score))
+
+
+@app.get("/api/reconciliation/sensitivity")
+def reconciliation_sensitivity():
+    """Ground-truth recall/precision vs. the date-match window (the 20% -> 97.5% story),
+    recomputed live at several window widths."""
+    return dao.recon_sensitivity()
 
 
 @app.get("/api/reconciliation/exceptions/{txn_id}")

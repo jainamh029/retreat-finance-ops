@@ -42,6 +42,22 @@ def test_dashboard_summary_is_passthrough():
     m.assert_called_once_with("2026-08-01")
 
 
+def test_dashboard_insights_passthrough():
+    canned = {"cei": {"cei": 69.4}, "dso_dpo_trend": {"points": []}, "top_overdue_ar": []}
+    with patch("backend.data_access.dashboard_insights", return_value=canned) as m:
+        r = client.get("/api/dashboard/insights?as_of=2026-07-01")
+    assert r.status_code == 200 and r.json() == canned
+    m.assert_called_once_with("2026-07-01")
+
+
+def test_reconciliation_sensitivity_passthrough():
+    canned = {"points": [{"date_window_days": 5, "recall_pct": 20.1}], "default_window": 30}
+    with patch("backend.data_access.recon_sensitivity", return_value=canned) as m:
+        r = client.get("/api/reconciliation/sensitivity")
+    assert r.status_code == 200 and r.json() == canned
+    m.assert_called_once_with()
+
+
 def test_invoices_forwards_all_filters():
     with patch("backend.data_access.invoices_view", return_value={"rows": []}) as m:
         r = client.get("/api/invoices?status=overdue&client_id=CLIENT_A&bucket=61-90"
@@ -271,3 +287,16 @@ def test_wiring_composes_on_fake_db(fake_db):
 
     inv = client.get("/api/invoices?bucket=31-60").json()
     assert inv["total"] == 1 and inv["rows"][0]["id"] == "AR2"   # AR2 open, ~37d overdue at as_of
+
+    ins = client.get("/api/dashboard/insights").json()
+    assert ins["dso_dpo_trend"]["points"][-1]["as_of"] == "2026-09-10"
+    assert ins["cei"]["cei"] is not None
+    # AR2 ($55k, open, overdue, client C1) is the sole overdue receivable
+    assert ins["top_overdue_ar"][0]["id"] == "C1" and ins["top_overdue_ar"][0]["overdue_amount"] == 55000.0
+    assert {c["category"] for c in ins["vendor_category_spend"]} <= {"venue", "catering", "travel", "activities", "other"}
+    assert ins["findings_breakdown"]["total"] == 1
+
+    sens = client.get("/api/reconciliation/sensitivity").json()
+    assert [p["date_window_days"] for p in sens["points"]] == [5, 10, 15, 20, 30, 45]
+    assert all(p["recall_pct"] <= sens["points"][i + 1]["recall_pct"]
+               for i, p in enumerate(sens["points"][:-1]))   # monotonic in the window

@@ -16,6 +16,7 @@ from backend import db
 from backend.config import AS_OF, ForecastConfig, ReconConfig
 from backend.logic import aging as _aging
 from backend.logic import cashflow as _cashflow
+from backend.logic import historical as _hist
 from backend.logic import reconcile as _recon
 
 # --------------------------------------------------------------------------------------
@@ -495,4 +496,100 @@ def recon_defaults() -> dict:
         },
         "forecast": {"defaults": asdict(f)},
         "data_as_of": data_as_of(),
+    }
+
+
+# --------------------------------------------------------------------------------------
+# dashboard insights — heavier derived KPIs (one payload; all from real underlying data)
+# --------------------------------------------------------------------------------------
+def _overdue_open(df: pd.DataFrame, id_col: str, aod: date) -> pd.DataFrame:
+    m = (df["status"].isin(["open", "partial"]) & (df["amount"] > 0)
+         & (df["due_date"].map(_aging._as_date) < aod))
+    return df[m]
+
+
+def dashboard_insights(as_of: str | None = None) -> dict:
+    t = tables()
+    aod = _as_of(as_of)
+    inv, bills = t["invoices_ar"], t["bills_ap"]
+    cnames = t["clients"].set_index("client_id")["name"].to_dict()
+    vnames = t["vendors"].set_index("vendor_id")["name"].to_dict()
+
+    # --- DSO/DPO reconstructed trend ---
+    trend = _hist.dso_dpo_trend(inv, bills, end=aod, months=7)
+
+    # --- Collection Effectiveness Index (classic formula, trailing 90d) ---
+    cei = _hist.collection_effectiveness_index(inv, end=aod, period_days=90)
+
+    # --- top overdue AR by client / AP by vendor ---
+    ar_od = _overdue_open(inv, "invoice_id", aod)
+    ar_top = (ar_od.groupby("client_id")["amount"].agg(["sum", "count"])
+              .sort_values("sum", ascending=False).head(8).reset_index())
+    top_ar = [{"id": r["client_id"], "name": cnames.get(r["client_id"], r["client_id"]),
+               "overdue_amount": round(float(r["sum"]), 2), "invoice_count": int(r["count"])}
+              for _, r in ar_top.iterrows()]
+    ap_od = _overdue_open(bills, "bill_id", aod)
+    ap_top = (ap_od.groupby("vendor_id")["amount"].agg(["sum", "count"])
+              .sort_values("sum", ascending=False).head(8).reset_index())
+    top_ap = [{"id": r["vendor_id"], "name": vnames.get(r["vendor_id"], r["vendor_id"]),
+               "overdue_amount": round(float(r["sum"]), 2), "bill_count": int(r["count"])}
+              for _, r in ap_top.iterrows()]
+
+    # --- vendor category spend (all AP, real) ---
+    cat = (bills.groupby("category")["amount"].agg(["sum", "count"]).reset_index())
+    spend = [{"category": r["category"], "amount": round(float(r["sum"]), 2),
+              "bill_count": int(r["count"])}
+             for _, r in cat.sort_values("sum", ascending=False).iterrows()]
+
+    # --- audit-findings breakdown (exception-aging substitute: date_found is the single
+    #     build date, so "days open" is not derivable — severity x type instead) ---
+    f = t["audit_findings"]
+    from collections import Counter
+    by_type = dict(sorted(Counter(f["finding_type"]).items()))
+    by_sev = dict(sorted(Counter(f["severity"]).items()))
+    grid = (f.groupby(["finding_type", "severity"]).size().reset_index(name="n"))
+    fb = {
+        "total": int(len(f)),
+        "by_type": {k: int(v) for k, v in by_type.items()},
+        "by_severity": {k: int(v) for k, v in by_sev.items()},
+        "grid": [{"finding_type": r["finding_type"], "severity": r["severity"], "n": int(r["n"])}
+                 for _, r in grid.iterrows()],
+        "real_vs_injected": {"organically_real": int(len(f) - (f["finding_type"] == "double_payment").sum()),
+                             "injected_double_payment": int((f["finding_type"] == "double_payment").sum())},
+        "note": "date_found is the single dataset build date, so open-duration is not derivable; "
+                "shown as a severity x type breakdown. duplicate + unexplained_txn + stale_90plus "
+                "are organically real; double_payment is the 3 injected operational-error cases.",
+    }
+
+    return {
+        "as_of": str(aod),
+        "dso_dpo_trend": trend,
+        "cei": cei,
+        "top_overdue_ar": top_ar,
+        "top_overdue_ap": top_ap,
+        "vendor_category_spend": spend,
+        "findings_breakdown": fb,
+        "provenance": _money_provenance(),
+    }
+
+
+# --------------------------------------------------------------------------------------
+# reconciliation match-rate sensitivity to the date window (the Step-6 story, computed live)
+# --------------------------------------------------------------------------------------
+def recon_sensitivity(windows: tuple[int, ...] = (5, 10, 15, 20, 30, 45)) -> dict:
+    pts = []
+    for w in windows:
+        res, gt = _run_recon(ReconConfig(date_window_days=w))
+        pts.append({
+            "date_window_days": w,
+            "recall_pct": gt["recall_pct"],
+            "precision_pct": gt["precision_pct"],
+            "matched": res.stats["matched"],
+        })
+    return {
+        "points": pts,
+        "default_window": ReconConfig().date_window_days,
+        "note": "ground-truth recall/precision vs. the due-date match window, recomputed live. "
+                "Measures timing-resolution + exception handling, not amount-fuzzing "
+                "(settlement amounts equal ledger amounts by construction — see DATA_NOTES.md).",
     }

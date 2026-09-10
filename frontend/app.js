@@ -17,6 +17,39 @@ const usd0 = (n) => (n == null || isNaN(n)) ? "—"
 const pct = (n) => (n == null || isNaN(n)) ? "—" : n.toFixed(1) + "%";
 const daysAgo = (n) => n == null ? "—" : n < 0 ? `in ${-n}d` : `${n}d`;
 
+const REDUCED_MOTION = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+
+// count-up tween for dashboard KPI values. `fmt` is one of the formatters above (by name).
+const FMT = { usd, usd0, pct, days: (n) => `${Number(n).toFixed(1)} days`, int: (n) => Math.round(n).toLocaleString("en-US") };
+function countUp(el, to, fmtName, from = 0, dur = 480) {
+  const fmt = FMT[fmtName] || String;
+  if (REDUCED_MOTION || from === to || !Number.isFinite(to)) { el.textContent = fmt(to); return; }
+  const t0 = performance.now();
+  const step = (now) => {
+    const p = Math.min(1, (now - t0) / dur);
+    const eased = 1 - Math.pow(1 - p, 3);
+    el.textContent = fmt(from + (to - from) * eased);
+    if (p < 1) requestAnimationFrame(step); else el.textContent = fmt(to);
+  };
+  requestAnimationFrame(step);
+}
+// brief highlight when a value changes after a live re-run
+function pulse(el) {
+  if (!el || REDUCED_MOTION) return;
+  el.classList.remove("flash");
+  void el.offsetWidth;               // restart the animation
+  el.classList.add("flash");
+  setTimeout(() => el.classList.remove("flash"), 750);
+}
+// skeleton placeholders shown while a view's data loads
+const skeletonCards = () =>
+  `<div class="skel"><div class="skel-line" style="width:180px"></div>
+     <div class="skel-card-row">${"<div class='skel-card'></div>".repeat(6)}</div>
+     <div class="skel-table">${"<div class='skel-tr'><span class='skel-cell'></span><span class='skel-cell'></span></div>".repeat(8)}</div></div>`;
+const skeletonTable = (cols = 7, rows = 12) =>
+  `<div class="skel"><div class="skel-line" style="width:220px"></div>
+     <div class="skel-table">${(`<div class='skel-tr'>${"<span class='skel-cell'></span>".repeat(cols)}</div>`).repeat(rows)}</div></div>`;
+
 async function api(path) {
   const r = await fetch(API_BASE + path, { headers: { "Accept": "application/json" } });
   if (!r.ok) {
@@ -77,6 +110,10 @@ function meter(c) {
 }
 const AGE_CLASS = { current: "age-current", "0-30": "age-0", "31-60": "age-1", "61-90": "age-2", "90+": "age-3" };
 const BUCKETS = ["current", "0-30", "31-60", "61-90", "90+"];
+// mirrors backend.data_access._list_view: these columns sort DESC, the rest ASC
+const SORT_DESC = new Set(["days_overdue", "amount"]);
+const sortCls = (col, active) =>
+  col === active ? (SORT_DESC.has(col) ? "sorted-desc" : "sorted-asc") : "";
 
 // ---------------------------------------------------------------------------
 // reconciliation tolerance config (persisted per viewer)
@@ -126,7 +163,10 @@ async function render() {
     a.setAttribute("aria-current", a.dataset.nav === route ? "page" : "false"));
   $$(".nav a").forEach(a => { if (a.dataset.nav === route) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current"); });
   const view = $("#view");
-  view.innerHTML = `<div class="loading">loading ${esc(route)}…</div>`;
+  view.innerHTML = route === "dashboard" ? skeletonCards()
+    : (route === "ar" || route === "ap") ? skeletonTable(9, 14)
+    : route === "reconcile" ? skeletonTable(8, 16)
+    : `<div class="loading">loading ${esc(route)}…</div>`;
   try {
     clearBanner();
     if (route === "dashboard") await viewDashboard(view);
@@ -135,6 +175,8 @@ async function render() {
     else if (route === "reconcile") await viewReconcile(view, params);
     else if (route === "budget") await viewBudget(view, params);
     else if (route === "benchmarks") await viewBenchmarks(view);
+    viewEnter(view);
+    initReveals(view);
     view.focus();
   } catch (e) {
     console.error(e);
@@ -143,33 +185,72 @@ async function render() {
   }
 }
 
+// quick fade/slide when a view swaps in (200ms; instant under reduced-motion)
+function viewEnter(el) {
+  if (REDUCED_MOTION) return;
+  el.classList.remove("view-enter");
+  void el.offsetWidth;
+  el.classList.add("view-enter");
+  el.addEventListener("animationend", () => el.classList.remove("view-enter"), { once: true });
+}
+
+// subtle fade-in-and-rise for section-level blocks as they scroll into view (once each).
+// Deliberately NOT applied to individual table rows — per-row animation in a 90/392/483-row
+// finance grid reads as gimmicky and fights scannability. Panels/figures/cards only.
+let _revealIO = null;
+function initReveals(scope) {
+  const els = $$(".reveal", scope);
+  if (REDUCED_MOTION || !("IntersectionObserver" in window)) {
+    els.forEach(e => e.classList.add("in"));
+    return;
+  }
+  _revealIO?.disconnect();
+  _revealIO = new IntersectionObserver((entries) => {
+    for (const en of entries) {
+      if (en.isIntersecting) { en.target.classList.add("in"); _revealIO.unobserve(en.target); }
+    }
+  }, { rootMargin: "0px 0px 240px 0px", threshold: 0.05 });
+  els.forEach(e => { if (isInViewport(e)) e.classList.add("in"); else _revealIO.observe(e); });
+  // safety net: nothing stays hidden forever if the observer never fires (fast Cmd+End,
+  // throttled IO, headless full-page capture, etc.)
+  clearTimeout(_revealSafety);
+  _revealSafety = setTimeout(() => els.forEach(e => e.classList.add("in")), 1800);
+}
+let _revealSafety = null;
+const isInViewport = (e) => { const r = e.getBoundingClientRect(); return r.top < innerHeight && r.bottom > 0; };
+
 // ---------------------------------------------------------------------------
 // DASHBOARD
 // ---------------------------------------------------------------------------
+let _prevCards = {};
 async function viewDashboard(view) {
-  const d = await api("/api/dashboard/summary");
+  const [d, ins] = await Promise.all([
+    api("/api/dashboard/summary"),
+    api("/api/dashboard/insights").catch(() => null),
+  ]);
   const c = d.cards;
   const inb = (x) => x ? chip({ cls: "pos", ic: "●", label: "in range" }) : chip({ cls: "warn", ic: "▲", label: "outside" });
+  const ceiTone = (v) => v == null ? "neutral" : v >= 90 ? "pos" : v >= 75 ? "warn" : "neg";
 
   view.innerHTML = `
     <h1>Dashboard</h1>
     <div class="card-row">
-      ${card("Total AR outstanding", usd0(c.ar_outstanding), `${c.ar_open_count} open invoices`)}
-      ${card("Total AP outstanding", usd0(c.ap_outstanding), `${c.ap_open_count} open bills`)}
-      ${card("DSO", c.dso.value + " days", `benchmark ${c.dso.benchmark[0]}–${c.dso.benchmark[1]}d ${inb(c.dso.in_benchmark)}`)}
-      ${card("DPO", c.dpo.value + " days", `benchmark ${c.dpo.benchmark[0]}–${c.dpo.benchmark[1]}d ${inb(c.dpo.in_benchmark)}`)}
-      ${card("Cash position", usd0(c.cash_position), `wk13 proj ${usd0(c.cash_position_week13)}`)}
-      ${card("Overdue invoices", String(c.overdue_invoice_count), usd0(c.overdue_amount) + " overdue", c.overdue_invoice_count > 0)}
+      ${card("Total AR outstanding", c.ar_outstanding, "usd0", `${c.ar_open_count} open invoices`)}
+      ${card("Total AP outstanding", c.ap_outstanding, "usd0", `${c.ap_open_count} open bills`)}
+      ${card("DSO", c.dso.value, "days", `benchmark ${c.dso.benchmark[0]}–${c.dso.benchmark[1]}d ${inb(c.dso.in_benchmark)}`)}
+      ${card("DPO", c.dpo.value, "days", `benchmark ${c.dpo.benchmark[0]}–${c.dpo.benchmark[1]}d ${inb(c.dpo.in_benchmark)}`)}
+      ${card("Cash position", c.cash_position, "usd0", `wk13 proj ${usd0(c.cash_position_week13)}`)}
+      ${card("Overdue invoices", c.overdue_invoice_count, "int", usd0(c.overdue_amount) + " overdue", c.overdue_invoice_count > 0)}
     </div>
 
     <div class="panel-grid">
-      <figure class="panel">
+      <figure class="panel reveal">
         <h2>AR / AP aging</h2>
         <div class="chart-wrap"><canvas id="agingChart"></canvas></div>
         <figcaption>Click a bar to filter the AR or AP table to that bucket.</figcaption>
         <table class="vh"><caption>Aging data</caption><tbody>${d.aging_chart.ar.map(b => `<tr><td>AR ${b.bucket}</td><td>${b.amount}</td></tr>`).join("")}${d.aging_chart.ap.map(b => `<tr><td>AP ${b.bucket}</td><td>${b.amount}</td></tr>`).join("")}</tbody></table>
       </figure>
-      <figure class="panel">
+      <figure class="panel reveal">
         <h2>13-week cash flow forecast</h2>
         <div class="chart-wrap"><canvas id="cashChart"></canvas></div>
         <figcaption>${d.shortfall_weeks.length
@@ -178,7 +259,65 @@ async function viewDashboard(view) {
       </figure>
     </div>
 
-    <div class="panel">
+    ${ins ? `
+    <div class="panel-grid">
+      <figure class="panel reveal">
+        <h2>DSO / DPO trend <span class="recon-tag" title="${esc(ins.dso_dpo_trend.note)}">reconstructed</span></h2>
+        <div class="chart-wrap"><canvas id="trendChart"></canvas></div>
+        <figcaption>Reconstructed from invoice/bill + payment dates — no stored historical balance. Bands: DSO 45–75, DPO 20–40.</figcaption>
+      </figure>
+      <figure class="panel reveal">
+        <h2>AR aging — waterfall</h2>
+        <div class="chart-wrap"><canvas id="waterfallChart"></canvas></div>
+        <figcaption>current → each overdue bucket, cumulating to total open AR (${usd0(c.ar_outstanding)}).</figcaption>
+      </figure>
+    </div>
+
+    <div class="panel-grid">
+      <div class="panel reveal">
+        <h2>Collections quality</h2>
+        <div class="cei-wrap">
+          <div class="cei-big ${ceiTone(ins.cei.cei)}">${ins.cei.cei == null ? "n/a" : ins.cei.cei + "%"}</div>
+          <div>
+            <div class="cei-name">Collection Effectiveness Index</div>
+            <div class="cei-sub">trailing ${ins.cei.period_days}d · ${ins.cei.interpretation}</div>
+          </div>
+        </div>
+        <dl class="cei-dl">
+          <dt>beginning receivables</dt><dd>${usd0(ins.cei.inputs.beginning_receivables)}</dd>
+          <dt>+ credit sales (period)</dt><dd>${usd0(ins.cei.inputs.credit_sales)}</dd>
+          <dt>− ending total receivables</dt><dd>${usd0(ins.cei.inputs.ending_total_receivables)}</dd>
+          <dt>− ending current receivables</dt><dd>${usd0(ins.cei.inputs.ending_current_receivables)}</dd>
+        </dl>
+        <figcaption>${esc(ins.cei.note)}</figcaption>
+      </div>
+      <figure class="panel reveal">
+        <h2>Vendor category spend</h2>
+        <div class="chart-wrap"><canvas id="catChart"></canvas></div>
+        <figcaption>All AP bills by category (real).</figcaption>
+      </figure>
+    </div>
+
+    <div class="panel-grid">
+      <figure class="panel reveal">
+        <h2>Top overdue clients (AR)</h2>
+        <div class="chart-wrap chart-sm"><canvas id="odArChart"></canvas></div>
+      </figure>
+      <figure class="panel reveal">
+        <h2>Top overdue vendors (AP)</h2>
+        <div class="chart-wrap chart-sm"><canvas id="odApChart"></canvas></div>
+      </figure>
+    </div>
+
+    <figure class="panel reveal">
+      <h2>Budget variance by retreat</h2>
+      <div class="chart-wrap"><canvas id="varScatter"></canvas></div>
+      <figcaption>Each dot = one retreat with actuals. <span style="color:var(--neg)">red</span> = &gt;10% over budget,
+        <span style="color:var(--pos)">green</span> = under. Hover for the retreat id.</figcaption>
+    </figure>
+    ` : `<div class="panel reveal banner-note">Insights unavailable (couldn't reach <code>/api/dashboard/insights</code>).</div>`}
+
+    <div class="panel reveal">
       <h2>Reconciliation & audit</h2>
       <p>
         <strong>${d.reconciliation.matched}</strong> matched ·
@@ -195,11 +334,34 @@ async function viewDashboard(view) {
 
   drawAging($("#agingChart"), d.aging_chart);
   drawCash($("#cashChart"), d.cashflow_chart);
+  if (ins) {
+    drawTrend($("#trendChart"), ins.dso_dpo_trend);
+    drawWaterfall($("#waterfallChart"), { buckets: d.aging_chart.ar });
+    drawDonut($("#catChart"), ins.vendor_category_spend);
+    drawHBar("odar", $("#odArChart"), ins.top_overdue_ar, C.dso);
+    drawHBar("odap", $("#odApChart"), ins.top_overdue_ap, C.warn);
+    try {
+      const rv = await api("/api/retreats");
+      drawVarScatter($("#varScatter"), rv.rows);
+    } catch { /* scatter optional */ }
+  }
+
+  // count-up each KPI from its previous value (0 on first load) to the new one
+  const nextPrev = {};
+  $$(".card .v[data-count]").forEach(el => {
+    const to = parseFloat(el.dataset.count), fmt = el.dataset.fmt, key = el.dataset.key;
+    countUp(el, to, fmt, _prevCards[key] ?? 0);
+    nextPrev[key] = to;
+  });
+  _prevCards = nextPrev;
 }
 
-function card(k, v, sub, alert) {
+function card(k, value, fmtName, sub, alert) {
+  const n = Number(value);
   return `<div class="card ${alert ? "alert" : ""}">
-    <div class="k">${esc(k)}</div><div class="v">${v}</div><div class="sub">${sub}</div></div>`;
+    <div class="k">${esc(k)}</div>
+    <div class="v" data-count="${n}" data-fmt="${fmtName}" data-key="${esc(k)}">${(FMT[fmtName] || String)(n)}</div>
+    <div class="sub">${sub}</div></div>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +433,162 @@ function fallbackTable(canvas, rows) {
   canvas.replaceWith(t);
 }
 
+// ---- palette for the new charts (status system unchanged; these are neutral data hues) ----
+const C = { dso: "#4c8dff", dpo: "#3fb950", pos: "#3fb950", warn: "#d29922", neg: "#f85149",
+  ink: "#e6edf3", dim: "#8b97a5", grid: "#2b3542",
+  cat: { travel: "#4c8dff", catering: "#3fb950", venue: "#d29922", activities: "#a371f7", other: "#8b97a5" } };
+const kbuck = (n) => "$" + Math.round(n / 1000) + "k";
+function baseOpts(extra = {}) {
+  const { plugins, scales, ...rest } = extra;   // rest carries indexAxis, cutout, etc.
+  return {
+    responsive: true, maintainAspectRatio: false, animation: REDUCED_MOTION ? false : { duration: 400 },
+    ...rest,
+    plugins: { legend: { labels: { color: C.dim, boxWidth: 10, font: { size: 11 } } }, ...(plugins || {}) },
+    scales: scales || {
+      x: { ticks: { color: C.dim, font: { size: 10 } }, grid: { color: C.grid } },
+      y: { ticks: { color: C.dim, font: { size: 10 }, callback: kbuck }, grid: { color: C.grid } },
+    },
+  };
+}
+function chart(key, canvas, cfg, fallbackRows) {
+  if (!window.Chart) return fallbackRows && fallbackTable(canvas, fallbackRows);
+  _charts[key]?.destroy();
+  _charts[key] = new Chart(canvas, cfg);
+}
+
+function drawTrend(canvas, trend) {
+  const P = trend.points, L = P.map(p => p.as_of.slice(0, 7));
+  chart("trend", canvas, {
+    type: "line",
+    data: { labels: L, datasets: [
+      { label: "DSO", data: P.map(p => p.dso), borderColor: C.dso, backgroundColor: C.dso + "22", tension: .3, pointRadius: 3, fill: false },
+      { label: "DPO", data: P.map(p => p.dpo), borderColor: C.dpo, backgroundColor: C.dpo + "22", tension: .3, pointRadius: 3, fill: false },
+    ]},
+    options: baseOpts({
+      plugins: { legend: { labels: { color: C.dim, boxWidth: 10 } },
+        annotation: undefined },
+      scales: { x: { ticks: { color: C.dim, font: { size: 10 } }, grid: { color: C.grid } },
+        y: { ticks: { color: C.dim, font: { size: 10 }, callback: (v) => v + "d" }, grid: { color: C.grid },
+             suggestedMin: 0, suggestedMax: 90 } },
+    }),
+  }, [["month", "DSO", "DPO"], ...P.map(p => [p.as_of, p.dso, p.dpo])]);
+}
+
+function drawWaterfall(canvas, ar) {
+  // cumulative build: current -> +0-30 -> +31-60 -> +61-90 -> +90+  (ends at total open)
+  const B = BUCKETS, amt = B.map(b => ar.buckets.find(x => x.bucket === b).amount);
+  let run = 0; const bases = [], tops = [];
+  amt.forEach(a => { bases.push(run); run += a; tops.push(run); });
+  chart("waterfall", canvas, {
+    type: "bar",
+    data: { labels: B, datasets: [{
+      label: "cumulative AR open",
+      data: amt.map((a, i) => [bases[i], tops[i]]),
+      backgroundColor: B.map(b => RAMP[b]), borderWidth: 0,
+    }]},
+    options: baseOpts({ plugins: { legend: { display: false },
+      tooltip: { callbacks: { label: (c) => `${c.label}: ${usd0(amt[c.dataIndex])}  (running ${usd0(tops[c.dataIndex])})` } } } }),
+  }, [["bucket", "amount"], ...B.map((b, i) => [b, amt[i]])]);
+}
+
+function drawDonut(canvas, spend) {
+  chart("cat", canvas, {
+    type: "doughnut",
+    data: { labels: spend.map(s => s.category),
+      datasets: [{ data: spend.map(s => s.amount),
+        backgroundColor: spend.map(s => C.cat[s.category] || C.dim), borderColor: "#171d26", borderWidth: 2 }] },
+    options: { responsive: true, maintainAspectRatio: false, cutout: "58%",
+      animation: REDUCED_MOTION ? false : { duration: 400 },
+      plugins: { legend: { position: "right", labels: { color: C.dim, boxWidth: 10, font: { size: 11 } } },
+        tooltip: { callbacks: { label: (c) => ` ${c.label}: ${usd0(c.raw)} (${spend[c.dataIndex].bill_count} bills)` } } } },
+  }, [["category", "amount"], ...spend.map(s => [s.category, s.amount])]);
+}
+
+function drawHBar(key, canvas, items, color) {
+  chart(key, canvas, {
+    type: "bar",
+    data: { labels: items.map(i => i.name),
+      datasets: [{ label: "overdue $", data: items.map(i => i.overdue_amount), backgroundColor: color, borderWidth: 0 }] },
+    options: baseOpts({ indexAxis: "y", plugins: { legend: { display: false },
+      tooltip: { callbacks: { label: (c) => ` ${usd0(c.raw)} · ${items[c.dataIndex].invoice_count ?? items[c.dataIndex].bill_count} items` } } },
+      scales: { x: { ticks: { color: C.dim, font: { size: 10 }, callback: kbuck }, grid: { color: C.grid } },
+        y: { ticks: { color: C.dim, font: { size: 10 } }, grid: { display: false } } } }),
+  }, [["name", "overdue"], ...items.map(i => [i.name, i.overdue_amount])]);
+}
+
+function drawVarScatter(canvas, retreats) {
+  const pts = retreats.filter(r => r.has_actuals).map(r => ({ x: r.variance_pct, y: r.actual_total,
+    r: r.over_budget ? 6 : 4, over: r.over_budget, id: r.retreat_id }));
+  chart("varscatter", canvas, {
+    type: "scatter",
+    data: { datasets: [{ label: "retreat",
+      data: pts, pointRadius: pts.map(p => p.r),
+      backgroundColor: pts.map(p => p.over ? C.neg : (p.x < 0 ? C.pos : C.dim)),
+      pointBorderColor: pts.map(p => p.over ? C.neg : "transparent") }] },
+    options: baseOpts({ plugins: { legend: { display: false },
+      tooltip: { callbacks: { label: (c) => `${pts[c.dataIndex].id}: ${pts[c.dataIndex].x > 0 ? "+" : ""}${pts[c.dataIndex].x}%  (actual ${usd0(pts[c.dataIndex].y)})` } } },
+      scales: {
+        x: { title: { display: true, text: "variance %", color: C.dim, font: { size: 10 } },
+             ticks: { color: C.dim, font: { size: 10 }, callback: (v) => v + "%" }, grid: { color: C.grid } },
+        y: { ticks: { color: C.dim, font: { size: 10 }, callback: kbuck }, grid: { color: C.grid } } } }),
+  });
+}
+
+function drawSensitivity(canvas, sens) {
+  const P = sens.points;
+  chart("sens", canvas, {
+    type: "line",
+    data: { labels: P.map(p => "±" + p.date_window_days + "d"), datasets: [
+      { label: "recall %", data: P.map(p => p.recall_pct), borderColor: C.dso, backgroundColor: C.dso + "22", tension: .25, pointRadius: 3, fill: true },
+      { label: "precision %", data: P.map(p => p.precision_pct), borderColor: C.pos, tension: .25, pointRadius: 3, fill: false },
+    ]},
+    options: baseOpts({ scales: {
+      x: { ticks: { color: C.dim, font: { size: 10 } }, grid: { color: C.grid } },
+      y: { ticks: { color: C.dim, font: { size: 10 }, callback: (v) => v + "%" }, grid: { color: C.grid }, min: 0, max: 100 } } }),
+  }, [["window", "recall", "precision"], ...P.map(p => [p.date_window_days, p.recall_pct, p.precision_pct])]);
+}
+
+const DTM_BINS = [[-99, 0, "≤0d"], [1, 5, "1–5d"], [6, 10, "6–10d"], [11, 15, "11–15d"],
+  [16, 20, "16–20d"], [21, 25, "21–25d"], [26, 30, "26–30d"], [31, 999, "30d+"]];
+function drawDtm(canvas, matched) {
+  const counts = DTM_BINS.map(() => 0);
+  matched.forEach(m => {
+    const d = m.date_delta_days;
+    const i = DTM_BINS.findIndex(([lo, hi]) => d >= lo && d <= hi);
+    if (i >= 0) counts[i]++;
+  });
+  chart("dtm", canvas, {
+    type: "bar",
+    data: { labels: DTM_BINS.map(b => b[2]),
+      datasets: [{ label: "matched transactions", data: counts,
+        backgroundColor: DTM_BINS.map((_, i) => i <= 2 ? C.pos : i <= 5 ? C.warn : C.neg), borderWidth: 0 }] },
+    options: baseOpts({ plugins: { legend: { display: false } },
+      scales: { x: { ticks: { color: C.dim, font: { size: 10 } }, grid: { display: false } },
+        y: { ticks: { color: C.dim, font: { size: 10 }, precision: 0 }, grid: { color: C.grid } } } }),
+  }, [["bucket", "count"], ...DTM_BINS.map((b, i) => [b[2], counts[i]])]);
+}
+
+function drawFindings(canvas, findings) {
+  const TYPES = ["unexplained_txn", "duplicate", "stale_90plus", "double_payment"];
+  const SEV = [["low", C.dim], ["medium", C.warn], ["high", C.neg]];
+  const g = {};
+  findings.forEach(f => { (g[f.finding_type] ||= {}); g[f.finding_type][f.severity] = (g[f.finding_type][f.severity] || 0) + 1; });
+  chart("findings", canvas, {
+    type: "bar",
+    data: {
+      labels: TYPES,
+      datasets: SEV.map(([s, col]) => ({
+        label: s, backgroundColor: col, borderWidth: 0,
+        data: TYPES.map(t => (g[t] || {})[s] || 0),
+      })),
+    },
+    options: baseOpts({ scales: {
+      x: { stacked: true, ticks: { color: C.dim, font: { size: 10 } }, grid: { display: false } },
+      y: { stacked: true, ticks: { color: C.dim, font: { size: 10 }, precision: 0 }, grid: { color: C.grid } },
+    } }),
+  }, [["type", "count"], ...TYPES.map(t => [t, Object.values(g[t] || {}).reduce((a, b) => a + b, 0)])]);
+}
+
 // ---------------------------------------------------------------------------
 // AR / AP LEDGER VIEW
 // ---------------------------------------------------------------------------
@@ -328,11 +646,11 @@ async function viewLedger(view, kind, params) {
           <th>${isAR ? "Client" : "Vendor"}</th>
           ${isAR ? "<th>Role</th>" : "<th>Category</th>"}
           <th>Retreat</th>
-          <th><button data-sort="${dateCol}">${isAR ? "Invoice date" : "Bill date"}</button></th>
-          <th><button data-sort="due_date">Due date</button></th>
-          <th class="num"><button data-sort="amount">Amount</button></th>
-          <th><button data-sort="status">Status</button></th>
-          <th class="num"><button data-sort="days_overdue">Days overdue</button></th>
+          <th><button data-sort="${dateCol}" class="${sortCls(dateCol, sort)}">${isAR ? "Invoice date" : "Bill date"}</button></th>
+          <th><button data-sort="due_date" class="${sortCls("due_date", sort)}">Due date</button></th>
+          <th class="num"><button data-sort="amount" class="${sortCls("amount", sort)}">Amount</button></th>
+          <th><button data-sort="status" class="${sortCls("status", sort)}">Status</button></th>
+          <th class="num"><button data-sort="days_overdue" class="${sortCls("days_overdue", sort)}">Days overdue</button></th>
         </tr></thead>
         <tbody>
           ${data.rows.map(r => `
@@ -373,7 +691,10 @@ async function viewLedger(view, kind, params) {
 // RECONCILIATION VIEW
 // ---------------------------------------------------------------------------
 async function viewReconcile(view, params) {
-  const rep = await fetchRecon();
+  const [rep, sens] = await Promise.all([
+    fetchRecon(),
+    api("/api/reconciliation/sensitivity").catch(() => null),
+  ]);
   const tab = params.get("tab") || "matched";
   const gt = rep.ground_truth;
   const st = rep.stats;
@@ -401,6 +722,21 @@ async function viewReconcile(view, params) {
       + ${rep.matched_accounting.wrong_target_primary} wrong-target
       + ${rep.matched_accounting.duplicate_settlement_first_of_pair} dup-settlement first-of-pair</div>
 
+    <div class="panel-grid">
+      <figure class="panel reveal">
+        <h2>Match rate vs. date window</h2>
+        <div class="chart-wrap chart-sm"><canvas id="sensChart"></canvas></div>
+        <figcaption>The 20% → 97.5% story: ground-truth recall/precision recomputed live at each window.
+          Timing-resolution + exception handling — not amount-fuzzing (see the note above).</figcaption>
+      </figure>
+      <figure class="panel reveal">
+        <h2>Days-to-match distribution</h2>
+        <div class="chart-wrap chart-sm"><canvas id="dtmChart"></canvas></div>
+        <figcaption>Δ between bank date and ledger due date across the ${rep.matched.length} matched transactions —
+          how fast reconciliation actually resolves.</figcaption>
+      </figure>
+    </div>
+
     <div class="tabbar" role="tablist">
       ${[["matched", `Matched (${rep.matched.length})`],
          ["unmatched_bank", `Unmatched bank (${rep.unmatched_bank.length})`],
@@ -413,6 +749,8 @@ async function viewReconcile(view, params) {
 
   $("#openGear").onclick = openGear;
   $$('[data-tab]').forEach(b => b.onclick = () => setTab(b.dataset.tab));
+  if (sens) drawSensitivity($("#sensChart"), sens);
+  drawDtm($("#dtmChart"), rep.matched);
   renderReconTab($("#reconBody"), rep, tab);
 }
 
@@ -467,6 +805,13 @@ function renderReconTab(root, rep, tab) {
     const groups = {};
     for (const f of rep.findings) (groups[f.finding_type] ||= []).push(f);
     root.innerHTML = `
+      <figure class="panel reveal" style="margin-bottom:var(--s-4)">
+        <h2>Findings by type &amp; severity</h2>
+        <div class="chart-wrap chart-sm"><canvas id="findingsChart"></canvas></div>
+        <figcaption>Stacked by severity. Open-duration isn't shown — <code>date_found</code> is the single
+          dataset build date. <code>duplicate</code> + <code>unexplained_txn</code> + <code>stale_90plus</code>
+          are organically real; <code>double_payment</code> = 3 injected cases.</figcaption>
+      </figure>
       <p class="banner-note">${rep.findings.length} findings, computed live at the current tolerance.
       <code>duplicate</code> (identical Berka rows) and <code>unexplained_txn</code> (real Berka
       interest / penalty / household rows) are genuine occurrences in the source data;
@@ -477,6 +822,7 @@ function renderReconTab(root, rep, tab) {
           <div>${esc(f.description)}</div>
           <div class="ids">${(f.related_ids || []).map(esc).join(" · ")}</div>
         </div>`).join("")}`).join("")}`;
+    drawFindings($("#findingsChart"), rep.findings);
   }
 }
 
@@ -616,11 +962,17 @@ async function runRecon() {
   saveCfg();
   closeGear();
   const body = $("#view");
-  body.style.opacity = ".5";
+  const prev = { r: $("#recallBig")?.textContent, p: $("#precBig")?.textContent };
+  body.style.opacity = REDUCED_MOTION ? "1" : ".55";
+  body.style.transition = "opacity 160ms ease";
   try {
     await fetchRecon(true);
     if (parseHash().route !== "reconcile") location.hash = "#/reconcile";
     else await render();
+    // pulse the headline numbers if they moved
+    const rb = $("#recallBig"), pb = $("#precBig");
+    if (rb && rb.textContent !== prev.r) pulse(rb);
+    if (pb && pb.textContent !== prev.p) pulse(pb);
   } catch (e) {
     banner("Reconciliation re-run failed: " + e.message);
   } finally {
@@ -661,11 +1013,13 @@ async function waitForBackend() {
       $("#asOf").textContent = "data as of " + h.data_as_of;
       return true;
     } catch {
-      view.innerHTML = `<div class="coldstart"><div class="spinner"></div>
-        <div>Backend is waking up…</div>
-        <div style="font-size:11px;color:var(--text-faint);max-width:32ch;text-align:center">
-          Render free tier sleeps after ~15&nbsp;min idle; the first request can take 30–50&nbsp;s.
-          Retrying automatically (attempt ${attempt + 1}).</div></div>`;
+      view.innerHTML = `<div class="coldstart">
+        <div class="spinner" aria-hidden="true"></div>
+        <div class="cs-title">Backend is waking up</div>
+        <div class="cs-bar" aria-hidden="true"></div>
+        <div class="cs-sub">Render's free tier sleeps after ~15&nbsp;min idle. The first request
+          takes 30–50&nbsp;s to spin it back up — this isn't an error. Retrying automatically.</div>
+        <div class="cs-attempt">attempt ${attempt + 1} / 12</div></div>`;
       await new Promise(r => setTimeout(r, delay));
       delay = Math.min(delay * 1.6, 8000);
     }
