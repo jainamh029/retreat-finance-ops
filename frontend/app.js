@@ -17,6 +17,39 @@ const usd0 = (n) => (n == null || isNaN(n)) ? "—"
 const pct = (n) => (n == null || isNaN(n)) ? "—" : n.toFixed(1) + "%";
 const daysAgo = (n) => n == null ? "—" : n < 0 ? `in ${-n}d` : `${n}d`;
 
+const REDUCED_MOTION = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+
+// count-up tween for dashboard KPI values. `fmt` is one of the formatters above (by name).
+const FMT = { usd, usd0, pct, days: (n) => `${Number(n).toFixed(1)} days`, int: (n) => Math.round(n).toLocaleString("en-US") };
+function countUp(el, to, fmtName, from = 0, dur = 480) {
+  const fmt = FMT[fmtName] || String;
+  if (REDUCED_MOTION || from === to || !Number.isFinite(to)) { el.textContent = fmt(to); return; }
+  const t0 = performance.now();
+  const step = (now) => {
+    const p = Math.min(1, (now - t0) / dur);
+    const eased = 1 - Math.pow(1 - p, 3);
+    el.textContent = fmt(from + (to - from) * eased);
+    if (p < 1) requestAnimationFrame(step); else el.textContent = fmt(to);
+  };
+  requestAnimationFrame(step);
+}
+// brief highlight when a value changes after a live re-run
+function pulse(el) {
+  if (!el || REDUCED_MOTION) return;
+  el.classList.remove("flash");
+  void el.offsetWidth;               // restart the animation
+  el.classList.add("flash");
+  setTimeout(() => el.classList.remove("flash"), 750);
+}
+// skeleton placeholders shown while a view's data loads
+const skeletonCards = () =>
+  `<div class="skel"><div class="skel-line" style="width:180px"></div>
+     <div class="skel-card-row">${"<div class='skel-card'></div>".repeat(6)}</div>
+     <div class="skel-table">${"<div class='skel-tr'><span class='skel-cell'></span><span class='skel-cell'></span></div>".repeat(8)}</div></div>`;
+const skeletonTable = (cols = 7, rows = 12) =>
+  `<div class="skel"><div class="skel-line" style="width:220px"></div>
+     <div class="skel-table">${(`<div class='skel-tr'>${"<span class='skel-cell'></span>".repeat(cols)}</div>`).repeat(rows)}</div></div>`;
+
 async function api(path) {
   const r = await fetch(API_BASE + path, { headers: { "Accept": "application/json" } });
   if (!r.ok) {
@@ -77,6 +110,10 @@ function meter(c) {
 }
 const AGE_CLASS = { current: "age-current", "0-30": "age-0", "31-60": "age-1", "61-90": "age-2", "90+": "age-3" };
 const BUCKETS = ["current", "0-30", "31-60", "61-90", "90+"];
+// mirrors backend.data_access._list_view: these columns sort DESC, the rest ASC
+const SORT_DESC = new Set(["days_overdue", "amount"]);
+const sortCls = (col, active) =>
+  col === active ? (SORT_DESC.has(col) ? "sorted-desc" : "sorted-asc") : "";
 
 // ---------------------------------------------------------------------------
 // reconciliation tolerance config (persisted per viewer)
@@ -126,7 +163,10 @@ async function render() {
     a.setAttribute("aria-current", a.dataset.nav === route ? "page" : "false"));
   $$(".nav a").forEach(a => { if (a.dataset.nav === route) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current"); });
   const view = $("#view");
-  view.innerHTML = `<div class="loading">loading ${esc(route)}…</div>`;
+  view.innerHTML = route === "dashboard" ? skeletonCards()
+    : (route === "ar" || route === "ap") ? skeletonTable(9, 14)
+    : route === "reconcile" ? skeletonTable(8, 16)
+    : `<div class="loading">loading ${esc(route)}…</div>`;
   try {
     clearBanner();
     if (route === "dashboard") await viewDashboard(view);
@@ -146,6 +186,7 @@ async function render() {
 // ---------------------------------------------------------------------------
 // DASHBOARD
 // ---------------------------------------------------------------------------
+let _prevCards = {};
 async function viewDashboard(view) {
   const d = await api("/api/dashboard/summary");
   const c = d.cards;
@@ -154,12 +195,12 @@ async function viewDashboard(view) {
   view.innerHTML = `
     <h1>Dashboard</h1>
     <div class="card-row">
-      ${card("Total AR outstanding", usd0(c.ar_outstanding), `${c.ar_open_count} open invoices`)}
-      ${card("Total AP outstanding", usd0(c.ap_outstanding), `${c.ap_open_count} open bills`)}
-      ${card("DSO", c.dso.value + " days", `benchmark ${c.dso.benchmark[0]}–${c.dso.benchmark[1]}d ${inb(c.dso.in_benchmark)}`)}
-      ${card("DPO", c.dpo.value + " days", `benchmark ${c.dpo.benchmark[0]}–${c.dpo.benchmark[1]}d ${inb(c.dpo.in_benchmark)}`)}
-      ${card("Cash position", usd0(c.cash_position), `wk13 proj ${usd0(c.cash_position_week13)}`)}
-      ${card("Overdue invoices", String(c.overdue_invoice_count), usd0(c.overdue_amount) + " overdue", c.overdue_invoice_count > 0)}
+      ${card("Total AR outstanding", c.ar_outstanding, "usd0", `${c.ar_open_count} open invoices`)}
+      ${card("Total AP outstanding", c.ap_outstanding, "usd0", `${c.ap_open_count} open bills`)}
+      ${card("DSO", c.dso.value, "days", `benchmark ${c.dso.benchmark[0]}–${c.dso.benchmark[1]}d ${inb(c.dso.in_benchmark)}`)}
+      ${card("DPO", c.dpo.value, "days", `benchmark ${c.dpo.benchmark[0]}–${c.dpo.benchmark[1]}d ${inb(c.dpo.in_benchmark)}`)}
+      ${card("Cash position", c.cash_position, "usd0", `wk13 proj ${usd0(c.cash_position_week13)}`)}
+      ${card("Overdue invoices", c.overdue_invoice_count, "int", usd0(c.overdue_amount) + " overdue", c.overdue_invoice_count > 0)}
     </div>
 
     <div class="panel-grid">
@@ -195,11 +236,23 @@ async function viewDashboard(view) {
 
   drawAging($("#agingChart"), d.aging_chart);
   drawCash($("#cashChart"), d.cashflow_chart);
+
+  // count-up each KPI from its previous value (0 on first load) to the new one
+  const nextPrev = {};
+  $$(".card .v[data-count]").forEach(el => {
+    const to = parseFloat(el.dataset.count), fmt = el.dataset.fmt, key = el.dataset.key;
+    countUp(el, to, fmt, _prevCards[key] ?? 0);
+    nextPrev[key] = to;
+  });
+  _prevCards = nextPrev;
 }
 
-function card(k, v, sub, alert) {
+function card(k, value, fmtName, sub, alert) {
+  const n = Number(value);
   return `<div class="card ${alert ? "alert" : ""}">
-    <div class="k">${esc(k)}</div><div class="v">${v}</div><div class="sub">${sub}</div></div>`;
+    <div class="k">${esc(k)}</div>
+    <div class="v" data-count="${n}" data-fmt="${fmtName}" data-key="${esc(k)}">${(FMT[fmtName] || String)(n)}</div>
+    <div class="sub">${sub}</div></div>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -328,11 +381,11 @@ async function viewLedger(view, kind, params) {
           <th>${isAR ? "Client" : "Vendor"}</th>
           ${isAR ? "<th>Role</th>" : "<th>Category</th>"}
           <th>Retreat</th>
-          <th><button data-sort="${dateCol}">${isAR ? "Invoice date" : "Bill date"}</button></th>
-          <th><button data-sort="due_date">Due date</button></th>
-          <th class="num"><button data-sort="amount">Amount</button></th>
-          <th><button data-sort="status">Status</button></th>
-          <th class="num"><button data-sort="days_overdue">Days overdue</button></th>
+          <th><button data-sort="${dateCol}" class="${sortCls(dateCol, sort)}">${isAR ? "Invoice date" : "Bill date"}</button></th>
+          <th><button data-sort="due_date" class="${sortCls("due_date", sort)}">Due date</button></th>
+          <th class="num"><button data-sort="amount" class="${sortCls("amount", sort)}">Amount</button></th>
+          <th><button data-sort="status" class="${sortCls("status", sort)}">Status</button></th>
+          <th class="num"><button data-sort="days_overdue" class="${sortCls("days_overdue", sort)}">Days overdue</button></th>
         </tr></thead>
         <tbody>
           ${data.rows.map(r => `
@@ -616,11 +669,17 @@ async function runRecon() {
   saveCfg();
   closeGear();
   const body = $("#view");
-  body.style.opacity = ".5";
+  const prev = { r: $("#recallBig")?.textContent, p: $("#precBig")?.textContent };
+  body.style.opacity = REDUCED_MOTION ? "1" : ".55";
+  body.style.transition = "opacity 160ms ease";
   try {
     await fetchRecon(true);
     if (parseHash().route !== "reconcile") location.hash = "#/reconcile";
     else await render();
+    // pulse the headline numbers if they moved
+    const rb = $("#recallBig"), pb = $("#precBig");
+    if (rb && rb.textContent !== prev.r) pulse(rb);
+    if (pb && pb.textContent !== prev.p) pulse(pb);
   } catch (e) {
     banner("Reconciliation re-run failed: " + e.message);
   } finally {
@@ -661,11 +720,13 @@ async function waitForBackend() {
       $("#asOf").textContent = "data as of " + h.data_as_of;
       return true;
     } catch {
-      view.innerHTML = `<div class="coldstart"><div class="spinner"></div>
-        <div>Backend is waking up…</div>
-        <div style="font-size:11px;color:var(--text-faint);max-width:32ch;text-align:center">
-          Render free tier sleeps after ~15&nbsp;min idle; the first request can take 30–50&nbsp;s.
-          Retrying automatically (attempt ${attempt + 1}).</div></div>`;
+      view.innerHTML = `<div class="coldstart">
+        <div class="spinner" aria-hidden="true"></div>
+        <div class="cs-title">Backend is waking up</div>
+        <div class="cs-bar" aria-hidden="true"></div>
+        <div class="cs-sub">Render's free tier sleeps after ~15&nbsp;min idle. The first request
+          takes 30–50&nbsp;s to spin it back up — this isn't an error. Retrying automatically.</div>
+        <div class="cs-attempt">attempt ${attempt + 1} / 12</div></div>`;
       await new Promise(r => setTimeout(r, delay));
       delay = Math.min(delay * 1.6, 8000);
     }
