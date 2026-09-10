@@ -1,0 +1,29 @@
+# --- python ---
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# --- local env / os ---
+.env
+.env.*
+.DS_Store
+
+# --- data pipeline ---
+# raw source datasets are large (UCI xlsx ~44 MB, Berka trans.asc ~66 MB) and are NOT
+# committed. `python data/build_dataset.py` downloads them from their canonical homes.
+data/raw/*.asc
+data/raw/*.xlsx
+data/raw/*.zip
+data/.cache/
+# but the tiny SEC EDGAR JSON (real provenance) IS kept:  !data/raw/sec/
+
+# --- sqlite side files (the deterministic .db itself IS committed) ---
+*.db-journal
+*.db-wal
+*.db-shm
+
+# --- build artifacts / local screenshots ---
+output/

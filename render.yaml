@@ -1,0 +1,20 @@
+# Render blueprint — backend only. Deploy: create a new Blueprint on render.com pointed at this repo.
+# The frontend goes to GitHub Pages (see .github/workflows/deploy-pages.yml).
+services:
+  - type: web
+    name: retreat-finance-ops-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn backend.api.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      # set this to your GitHub Pages URL, e.g. https://<user>.github.io
+      - key: ALLOWED_ORIGINS
+        sync: false
+    autoDeploy: true
+# data/retreat_finance.db is committed (small, deterministic), so the service has data on boot.
+# To rebuild from raw sources on deploy instead, prepend to buildCommand:
+#   python data/build_dataset.py &&

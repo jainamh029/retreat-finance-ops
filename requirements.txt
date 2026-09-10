@@ -1,0 +1,24 @@
+# Retreat Finance Ops — Python dependencies (Python 3.11+)
+# Pinned to what the project was built and tested against. `pip install -r requirements.txt`
+# into a fresh venv reproduces the environment.
+
+# --- data pipeline (data/build_dataset.py) ---
+openpyxl==3.1.5           # read UCI Online Retail II xlsx
+requests==2.32.3          # SEC EDGAR XBRL API (pipeline only)
+
+# --- analytics / logic (backend/logic/*) ---
+pandas==3.0.5
+rapidfuzz==3.14.6        # fuzzy transaction-description matching in reconcile.py
+
+# --- Excel model (retreat_finance_model.xlsx, Step "build the Excel model") ---
+XlsxWriter==3.2.0
+
+# --- backend API (Step 7) ---
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+SQLAlchemy==2.0.36
+
+# --- tests / lint ---
+pytest==9.1.1
+httpx==0.28.1            # FastAPI TestClient (Step 7)
+ruff==0.16.7
